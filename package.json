@@ -1,0 +1,14 @@
+{
+  "name": "saweria-roblox-bridge",
+  "version": "1.0.0",
+  "description": "Jembatan webhook Saweria -> Roblox untuk sistem donasi Saweria",
+  "private": true,
+  "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.25.0",
+    "express": "^4.18.2"
+  }
+}
