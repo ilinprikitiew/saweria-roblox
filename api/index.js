@@ -473,7 +473,7 @@ app.get(["/", "/status"], async (req, res) => {
               esc(l.source || "") +
               '</span></td><td class="t" data-at="' +
               (l.at || Date.now()) +
-              ""></td></tr>"
+              "\"></td></tr>"
             );
           })
           .join("")
@@ -485,7 +485,7 @@ app.get(["/", "/status"], async (req, res) => {
   const amalLogsHtml = renderLogRows(amalLogs);
 
   const html =
-    "<!doctype html><html lang="id"><head><meta charset="utf-8">" +
+    "<!doctype html><html lang=\"id\"><head><meta charset=\"utf-8\">" +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     "<title>Status Jembatan Saweria + BagiBagi + Amalsholeh</title><style>" +
     "*{box-sizing:border-box}body{margin:0;background:#0f1115;color:#e7e7ea;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:20px}" +
@@ -501,7 +501,7 @@ app.get(["/", "/status"], async (req, res) => {
     "table{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}th,td{text-align:left;padding:8px 6px;border-bottom:1px solid #20242d}th{color:#9aa0a6;font-weight:600}" +
     ".amt{color:#5fd07f;font-weight:600;white-space:nowrap}.src{color:#9aa0a6;font-size:11px}.t{color:#9aa0a6;white-space:nowrap}.muted{color:#9aa0a6;text-align:center;padding:18px}" +
     "h2{font-size:15px;margin:0 0 10px}" +
-    "</style></head><body><div class="wrap">" +
+    "</style></head><body><div class=\"wrap\">" +
     "<h1>&#128225; Status Jembatan Saweria + BagiBagi + Amalsholeh &#8594; Roblox</h1>" +
     '<p class="sub">Halaman ini buat ngecek semua jalan. Refresh untuk update.</p>' +
     '<div class="card"><h2>Saweria</h2>' +
@@ -524,7 +524,7 @@ app.get(["/", "/status"], async (req, res) => {
     '<div class="row"><span class="k">Donasi di antrian (belum diambil Roblox)</span><b>' + amalQueueLen + "</b></div>" +
     "</div>" +
     '<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">' +
-    "<div><b>Tes tanpa donasi beneran</b><div class="sub" style="margin:2px 0 0">Masukkan 1 donasi palsu ke antrian.</div></div>" +
+    "<div><b>Tes tanpa donasi beneran</b><div class=\"sub\" style=\"margin:2px 0 0\">Masukkan 1 donasi palsu ke antrian.</div></div>" +
     '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
     '<button id="tb" onclick="testDonate()">Tes Saweria</button>' +
     '<button id="tbBagi" onclick="testDonateBagi()">Tes BagiBagi</button>' +
