@@ -1,13 +1,14 @@
 // ============================================================
-//  JEMBATAN WEBHOOK SAWERIA + BAGIBAGI  ->  ROBLOX
-//  Versi 1.1 (nambah dukungan BagiBagi, jalur Saweria TIDAK diubah)
+//  JEMBATAN WEBHOOK SAWERIA + BAGIBAGI + AMALSHOLEH  ->  ROBLOX
+//  Versi 1.2 (nambah dukungan Amalsholeh, jalur Saweria & BagiBagi TIDAK diubah)
 //
 //  Tugas server ini:
-//   1) Menerima "tembakan" donasi dari Saweria & BagiBagi (webhook / POST).
+//   1) Menerima "tembakan" donasi dari Saweria, BagiBagi & Amalsholeh (webhook / POST).
 //   2) Menyimpannya di antrian (Redis) -- MASING-MASING PLATFORM PUNYA ANTRIAN SENDIRI.
 //   3) Memberikannya ke Roblox satu per satu saat Roblox bertanya
-//      (GET /prime untuk Saweria, GET /prime-bagibagi untuk BagiBagi),
-//      supaya tiap donasi cuma diproses 1x per platform.
+//      (GET /prime untuk Saweria, GET /prime-bagibagi untuk BagiBagi,
+//      GET /prime-amalsholeh untuk Amalsholeh), supaya tiap donasi cuma
+//      diproses 1x per platform.
 //
 //  Endpoint Saweria (TIDAK BERUBAH dari versi 1.0):
 //   GET  /prime              -> ambil 1 donasi Saweria terbaru { donator, amount, message }
@@ -15,17 +16,31 @@
 //   POST /webhook            -> dipanggil Saweria saat ada donasi
 //   POST /test-donate        -> kirim donasi Saweria palsu buat ngetes
 //
-//  Endpoint BagiBagi (BARU di versi 1.1):
+//  Endpoint BagiBagi (TIDAK BERUBAH dari versi 1.1):
 //   GET  /prime-bagibagi          -> ambil 1 donasi BagiBagi terbaru { donator, amount, message }
 //   POST /webhook-bagibagi        -> dipanggil BagiBagi saat ada donasi (Custom Webhook)
 //   POST /test-donate-bagibagi    -> kirim donasi BagiBagi palsu buat ngetes
 //
+//  Endpoint Amalsholeh (BARU di versi 1.2):
+//   GET  /prime-amalsholeh        -> ambil 1 donasi Amalsholeh terbaru { donator, amount, message }
+//   POST /webhook-amalsholeh      -> dipanggil Amalsholeh saat ada donasi sukses
+//   POST /test-donate-amalsholeh  -> kirim donasi Amalsholeh palsu buat ngetes
+//
+//  CATATAN KHUSUS Amalsholeh (beda dari Saweria/BagiBagi):
+//   Amalsholeh TIDAK menyediakan mekanisme signature/HMAC/token verifikasi
+//   apa pun di webhook-nya (sudah dicek di dokumentasi resmi mereka,
+//   help.amalsholeh.com). Makanya proteksi endpoint /webhook-amalsholeh
+//   MURNI dari query param ?key=... yang kita buat sendiri (lihat
+//   AMALSHOLEH_WEBHOOK_SECRET di bawah) -- BUKAN dari Amalsholeh. Key ini
+//   ditempel di URL yang didaftarkan sebagai webhook campaign, dan sengaja
+//   TIDAK ditampilkan di halaman status (GET /) karena halaman itu publik.
+//
 //  GET  /                   -> halaman status (buka di browser)
 //
-//  CATATAN soal leaderboard yang kosong (BERLAKU JUGA utk BagiBagi):
+//  CATATAN soal leaderboard yang kosong (BERLAKU JUGA utk BagiBagi & Amalsholeh):
 //   Script Roblox (SaweriaServer) SUDAH menjumlahkan tiap donasi -- dari
 //   platform MANAPUN -- ke DataStore-nya sendiri. Makanya server ini TIDAK
-//   punya endpoint "/prime-bagibagi/leaderboard" sama sekali -- leaderboard
+//   punya endpoint leaderboard terpisah utk BagiBagi/Amalsholeh -- leaderboard
 //   gabungan cukup dihitung di sisi Roblox, sama seperti pola Saweria yang
 //   sudah terbukti aman (baca README bagian lama).
 // ============================================================
@@ -39,9 +54,15 @@ const { Redis } = require("@upstash/redis");
 // Stream Key dari Saweria. (TIDAK BERUBAH)
 const STREAM_KEY = process.env.SAWERIA_STREAM_KEY || "";
 
-// Webhook Token dari BagiBagi (dashboard -> Overlay Integration -> Custom Webhook).
-// Kalau dikosongkan -> verifikasi dilewati (mode tes, kurang aman), sama seperti STREAM_KEY.
+// Webhook Token dari BagiBagi (dashboard -> Overlay Integration -> Custom Webhook). (TIDAK BERUBAH)
 const BAGIBAGI_WEBHOOK_TOKEN = process.env.BAGIBAGI_WEBHOOK_TOKEN || "";
+
+// Secret key BUATAN SENDIRI untuk Amalsholeh (Amalsholeh TIDAK menyediakan
+// signature/token verifikasi apa pun di webhook-nya). Ditempel sebagai query
+// param ?key=... di URL webhook yang didaftarkan ke campaign Amalsholeh
+// (lewat pihak yang bikin campaign-nya). Kalau dikosongkan -> verifikasi
+// dilewati (mode tes, kurang aman), sama seperti STREAM_KEY & BAGIBAGI_WEBHOOK_TOKEN.
+const AMALSHOLEH_WEBHOOK_SECRET = process.env.AMALSHOLEH_WEBHOOK_SECRET || "";
 
 // Koneksi Redis (Upstash). (TIDAK BERUBAH)
 const redis = new Redis({
@@ -53,10 +74,14 @@ const QUEUE_KEY = "saweria:queue"; // antrian donasi Saweria yang belum diambil 
 const LOG_KEY = "saweria:log";     // catatan 20 donasi Saweria terakhir (TIDAK BERUBAH)
 const LOG_MAX = 20;
 
-// Antrian & log KHUSUS BagiBagi -- TERPISAH TOTAL dari punya Saweria,
-// supaya tidak mungkin saling menimpa/ganggu.
+// Antrian & log KHUSUS BagiBagi -- TERPISAH TOTAL dari punya Saweria. (TIDAK BERUBAH)
 const BAGI_QUEUE_KEY = "bagibagi:queue";
 const BAGI_LOG_KEY = "bagibagi:log";
+
+// Antrian & log KHUSUS Amalsholeh -- TERPISAH TOTAL dari Saweria & BagiBagi,
+// supaya tidak mungkin saling menimpa/ganggu.
+const AMAL_QUEUE_KEY = "amalsholeh:queue";
+const AMAL_LOG_KEY = "amalsholeh:log";
 
 const app = express();
 
@@ -96,9 +121,7 @@ function verifySaweriaSignature(req) {
   return { ok, reason: ok ? null : "bad-signature" };
 }
 
-// Verifikasi tanda tangan webhook BagiBagi (HMAC-SHA256 pakai Webhook Token).
-// Sesuai dokumentasi resmi BagiBagi: header "X-Bagibagi-Signature", isinya
-// HMAC-SHA256(key = Webhook Token, message = JSON.stringify(body)), hex digest.
+// Verifikasi tanda tangan webhook BagiBagi (HMAC-SHA256 pakai Webhook Token). (TIDAK BERUBAH)
 function verifyBagibagiSignature(req) {
   if (!BAGIBAGI_WEBHOOK_TOKEN) return { ok: true, skipped: true }; // mode tes
   const got = req.get("X-Bagibagi-Signature") || "";
@@ -115,6 +138,19 @@ function verifyBagibagiSignature(req) {
 
   const ok = candidates.some((s) => safeEqualHex(hmac(s), got));
   return { ok, reason: ok ? null : "bad-signature" };
+}
+
+// Verifikasi request webhook Amalsholeh. BEDA dari Saweria/BagiBagi: Amalsholeh
+// TIDAK punya mekanisme signature/HMAC sama sekali di dokumentasi resminya,
+// jadi proteksi endpoint ini murni dari query param ?key=... yang cuma KITA
+// yang tahu (dibuat sendiri, BUKAN dari Amalsholeh), ditempel di URL webhook
+// yang didaftarkan ke campaign.
+function verifyAmalsholehSecret(req) {
+  if (!AMALSHOLEH_WEBHOOK_SECRET) return { ok: true, skipped: true }; // mode tes
+  const got = (req.query && req.query.key) || "";
+  if (!got) return { ok: false, reason: "no-key-param" };
+  const ok = safeEqualHex(got, AMALSHOLEH_WEBHOOK_SECRET);
+  return { ok, reason: ok ? null : "bad-key" };
 }
 
 // Ambil field penting dari payload Saweria (TIDAK BERUBAH).
@@ -136,13 +172,30 @@ function pickDonationFields(body) {
   return { donator: String(donator), amount, message: String(message) };
 }
 
-// Ambil field penting dari payload BagiBagi.
+// Ambil field penting dari payload BagiBagi (TIDAK BERUBAH).
 // Bentuk resmi (dari docs.bagibagi.co): { transaction_id, name, amount, message, mediaShareUrl, created_at }
 function pickBagibagiDonationFields(body) {
   body = body || {};
   const donator = body.name || body.donator || "Anonim";
   const amount = Number(body.amount != null ? body.amount : 0) || 0;
   const message = body.message || "";
+  return { donator: String(donator), amount, message: String(message) };
+}
+
+// Ambil field penting dari payload Amalsholeh.
+// Bentuk resmi (dari help.amalsholeh.com):
+//   { type: "donation", data: { donation: { amount, total, unique_code, ... },
+//                                user: { name, email, phone, message } } }
+// PENTING: pakai "amount" (nominal bersih yang diketik donatur), BUKAN
+// "total" (amount + unique_code, itu cuma buat pencocokan transfer bank).
+function pickAmalsholehDonationFields(body) {
+  body = body || {};
+  const data = body.data || {};
+  const donation = data.donation || {};
+  const user = data.user || {};
+  const donator = user.name || "Hamba Allah";
+  const amount = Number(donation.amount != null ? donation.amount : 0) || 0;
+  const message = user.message || "";
   return { donator: String(donator), amount, message: String(message) };
 }
 
@@ -194,12 +247,30 @@ app.get(["/prime/leaderboard", "/api/prime/leaderboard"], (req, res) => {
 });
 
 // ============================================================
-//  GET /prime-bagibagi  -> Roblox ambil 1 donasi BagiBagi terbaru (BARU)
-//  Pola identik /prime, TAPI ambil dari antrian Redis terpisah.
+//  GET /prime-bagibagi  -> Roblox ambil 1 donasi BagiBagi terbaru (TIDAK BERUBAH)
 // ============================================================
 app.get(["/prime-bagibagi", "/api/prime-bagibagi"], async (req, res) => {
   try {
     const raw = await redis.lpop(BAGI_QUEUE_KEY);
+    const item = parseMaybe(raw);
+    if (!item) return res.type("application/json").send("{}");
+    return res.json({
+      donator: item.donator,
+      amount: Number(item.amount) || 0,
+      message: item.message || "...",
+    });
+  } catch (e) {
+    return res.type("application/json").send("{}");
+  }
+});
+
+// ============================================================
+//  GET /prime-amalsholeh  -> Roblox ambil 1 donasi Amalsholeh terbaru (BARU)
+//  Pola identik /prime & /prime-bagibagi, TAPI ambil dari antrian Redis terpisah.
+// ============================================================
+app.get(["/prime-amalsholeh", "/api/prime-amalsholeh"], async (req, res) => {
+  try {
+    const raw = await redis.lpop(AMAL_QUEUE_KEY);
     const item = parseMaybe(raw);
     if (!item) return res.type("application/json").send("{}");
     return res.json({
@@ -236,7 +307,7 @@ app.post(["/webhook", "/api/webhook"], async (req, res) => {
 });
 
 // ============================================================
-//  POST /webhook-bagibagi  -> dipanggil BagiBagi saat ada donasi (BARU)
+//  POST /webhook-bagibagi  -> dipanggil BagiBagi saat ada donasi (TIDAK BERUBAH)
 // ============================================================
 app.post(["/webhook-bagibagi", "/api/webhook-bagibagi"], async (req, res) => {
   const sig = verifyBagibagiSignature(req);
@@ -264,6 +335,40 @@ app.post(["/webhook-bagibagi", "/api/webhook-bagibagi"], async (req, res) => {
 });
 
 // ============================================================
+//  POST /webhook-amalsholeh  -> dipanggil Amalsholeh saat ada donasi sukses (BARU)
+// ============================================================
+app.post(["/webhook-amalsholeh", "/api/webhook-amalsholeh"], async (req, res) => {
+  const sig = verifyAmalsholehSecret(req);
+  if (!sig.ok) {
+    console.warn("[webhook-amalsholeh] ditolak:", sig.reason);
+    return res.status(401).json({ ok: false, error: sig.reason });
+  }
+  const body = req.body || {};
+  if (body.type !== "donation" || !body.data) {
+    // Tetap 200 biar Amalsholeh gak retry terus-terusan utk payload yang tidak dikenali.
+    console.warn("[webhook-amalsholeh] payload tidak dikenali:", JSON.stringify(body));
+    return res.json({ ok: true, ignored: true });
+  }
+  const d = pickAmalsholehDonationFields(body);
+  if (!d.donator || d.amount <= 0) {
+    return res.status(400).json({ ok: false, error: "data donasi tidak lengkap" });
+  }
+  try {
+    await pushDonation(
+      d,
+      sig.skipped ? "webhook-amalsholeh(tanpa-verifikasi)" : "webhook-amalsholeh",
+      AMAL_QUEUE_KEY,
+      AMAL_LOG_KEY
+    );
+    console.log("[webhook-amalsholeh] donasi diterima:", d.donator, d.amount);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[webhook-amalsholeh] gagal simpan:", e);
+    return res.status(500).json({ ok: false, error: "gagal simpan ke database" });
+  }
+});
+
+// ============================================================
 //  POST /test-donate  -> kirim donasi Saweria palsu (TIDAK BERUBAH)
 // ============================================================
 app.post(["/test-donate", "/api/test-donate"], async (req, res) => {
@@ -280,7 +385,7 @@ app.post(["/test-donate", "/api/test-donate"], async (req, res) => {
 });
 
 // ============================================================
-//  POST /test-donate-bagibagi  -> kirim donasi BagiBagi palsu (BARU)
+//  POST /test-donate-bagibagi  -> kirim donasi BagiBagi palsu (TIDAK BERUBAH)
 // ============================================================
 app.post(["/test-donate-bagibagi", "/api/test-donate-bagibagi"], async (req, res) => {
   const d = pickBagibagiDonationFields(req.body);
@@ -296,7 +401,23 @@ app.post(["/test-donate-bagibagi", "/api/test-donate-bagibagi"], async (req, res
 });
 
 // ============================================================
-//  GET /  -> halaman status (DIPERLUAS: sekarang nampilin BagiBagi juga)
+//  POST /test-donate-amalsholeh  -> kirim donasi Amalsholeh palsu (BARU)
+// ============================================================
+app.post(["/test-donate-amalsholeh", "/api/test-donate-amalsholeh"], async (req, res) => {
+  const d = pickAmalsholehDonationFields(req.body);
+  if (!d.donator || d.donator === "Hamba Allah") d.donator = "TestUserAmalsholeh";
+  if (d.amount <= 0) d.amount = 50000;
+  if (!d.message) d.message = "[TES Amalsholeh] dari halaman status";
+  try {
+    await pushDonation(d, "test-amalsholeh", AMAL_QUEUE_KEY, AMAL_LOG_KEY);
+    return res.json({ ok: true, donation: d });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// ============================================================
+//  GET /  -> halaman status (DIPERLUAS: sekarang nampilin Amalsholeh juga)
 // ============================================================
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => {
@@ -308,15 +429,20 @@ app.get(["/", "/status"], async (req, res) => {
   let redisOk = false;
   let queueLen = 0;
   let bagiQueueLen = 0;
+  let amalQueueLen = 0;
   let logs = [];
   let bagiLogs = [];
+  let amalLogs = [];
   try {
     queueLen = await redis.llen(QUEUE_KEY);
     bagiQueueLen = await redis.llen(BAGI_QUEUE_KEY);
+    amalQueueLen = await redis.llen(AMAL_QUEUE_KEY);
     const raw = await redis.lrange(LOG_KEY, 0, LOG_MAX - 1);
     logs = (raw || []).map(parseMaybe).filter(Boolean);
     const bagiRaw = await redis.lrange(BAGI_LOG_KEY, 0, LOG_MAX - 1);
     bagiLogs = (bagiRaw || []).map(parseMaybe).filter(Boolean);
+    const amalRaw = await redis.lrange(AMAL_LOG_KEY, 0, LOG_MAX - 1);
+    amalLogs = (amalRaw || []).map(parseMaybe).filter(Boolean);
     redisOk = true;
   } catch (e) {
     redisOk = false;
@@ -327,6 +453,7 @@ app.get(["/", "/status"], async (req, res) => {
 
   const verifyOn = !!STREAM_KEY;
   const bagiVerifyOn = !!BAGIBAGI_WEBHOOK_TOKEN;
+  const amalVerifyOn = !!AMALSHOLEH_WEBHOOK_SECRET;
   const okBadge = '<span class="b ok">&#10003; tersambung</span>';
   const errBadge = '<span class="b err">&#10007; gagal — cek integrasi Upstash</span>';
 
@@ -346,7 +473,7 @@ app.get(["/", "/status"], async (req, res) => {
               esc(l.source || "") +
               '</span></td><td class="t" data-at="' +
               (l.at || Date.now()) +
-              "\"></td></tr>"
+              ""></td></tr>"
             );
           })
           .join("")
@@ -355,11 +482,12 @@ app.get(["/", "/status"], async (req, res) => {
 
   const logsHtml = renderLogRows(logs);
   const bagiLogsHtml = renderLogRows(bagiLogs);
+  const amalLogsHtml = renderLogRows(amalLogs);
 
   const html =
-    "<!doctype html><html lang=\"id\"><head><meta charset=\"utf-8\">" +
+    "<!doctype html><html lang="id"><head><meta charset="utf-8">" +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
-    "<title>Status Jembatan Saweria + BagiBagi</title><style>" +
+    "<title>Status Jembatan Saweria + BagiBagi + Amalsholeh</title><style>" +
     "*{box-sizing:border-box}body{margin:0;background:#0f1115;color:#e7e7ea;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:20px}" +
     ".wrap{max-width:780px;margin:0 auto}h1{font-size:20px;margin:0 0 4px}.sub{color:#9aa0a6;font-size:13px;margin:0 0 18px}" +
     ".card{background:#171a21;border:1px solid #262b35;border-radius:12px;padding:16px;margin-bottom:14px}" +
@@ -373,8 +501,8 @@ app.get(["/", "/status"], async (req, res) => {
     "table{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}th,td{text-align:left;padding:8px 6px;border-bottom:1px solid #20242d}th{color:#9aa0a6;font-weight:600}" +
     ".amt{color:#5fd07f;font-weight:600;white-space:nowrap}.src{color:#9aa0a6;font-size:11px}.t{color:#9aa0a6;white-space:nowrap}.muted{color:#9aa0a6;text-align:center;padding:18px}" +
     "h2{font-size:15px;margin:0 0 10px}" +
-    "</style></head><body><div class=\"wrap\">" +
-    "<h1>&#128225; Status Jembatan Saweria + BagiBagi &#8594; Roblox</h1>" +
+    "</style></head><body><div class="wrap">" +
+    "<h1>&#128225; Status Jembatan Saweria + BagiBagi + Amalsholeh &#8594; Roblox</h1>" +
     '<p class="sub">Halaman ini buat ngecek semua jalan. Refresh untuk update.</p>' +
     '<div class="card"><h2>Saweria</h2>' +
     '<div class="row"><span class="k">Database (Redis)</span>' + (redisOk ? okBadge : errBadge) + "</div>" +
@@ -389,11 +517,18 @@ app.get(["/", "/status"], async (req, res) => {
     "</div>" +
     '<div class="row"><span class="k">Donasi di antrian (belum diambil Roblox)</span><b>' + bagiQueueLen + "</b></div>" +
     "</div>" +
+    '<div class="card"><h2>Amalsholeh</h2>' +
+    '<div class="row"><span class="k">Verifikasi key Amalsholeh (buatan sendiri)</span>' +
+    (amalVerifyOn ? '<span class="b on">aktif (aman)</span>' : '<span class="b warn">nonaktif (mode tes)</span>') +
+    "</div>" +
+    '<div class="row"><span class="k">Donasi di antrian (belum diambil Roblox)</span><b>' + amalQueueLen + "</b></div>" +
+    "</div>" +
     '<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">' +
-    "<div><b>Tes tanpa donasi beneran</b><div class=\"sub\" style=\"margin:2px 0 0\">Masukkan 1 donasi palsu ke antrian.</div></div>" +
+    "<div><b>Tes tanpa donasi beneran</b><div class="sub" style="margin:2px 0 0">Masukkan 1 donasi palsu ke antrian.</div></div>" +
     '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
     '<button id="tb" onclick="testDonate()">Tes Saweria</button>' +
     '<button id="tbBagi" onclick="testDonateBagi()">Tes BagiBagi</button>' +
+    '<button id="tbAmal" onclick="testDonateAmal()">Tes Amalsholeh</button>' +
     "</div></div></div>" +
     '<div class="card urls"><b>Tempel link berikut:</b>' +
     '<div><span class="lbl">Webhook Saweria (Settings &#8594; Integrations &#8594; Webhook):</span><code>' + esc(base) + "/webhook</code></div>" +
@@ -401,6 +536,8 @@ app.get(["/", "/status"], async (req, res) => {
     '<div><span class="lbl">LEADERBOARD_API_URL di SaweriaServer Roblox:</span><code>' + esc(base) + "/prime/leaderboard</code></div>" +
     '<div><span class="lbl">Custom Webhook BagiBagi (dashboard &#8594; Overlay Integration):</span><code>' + esc(base) + "/webhook-bagibagi</code></div>" +
     '<div><span class="lbl">Endpoint polling BagiBagi di Roblox:</span><code>' + esc(base) + "/prime-bagibagi</code></div>" +
+    '<div><span class="lbl">Endpoint polling Amalsholeh di Roblox:</span><code>' + esc(base) + "/prime-amalsholeh</code></div>" +
+    '<div><span class="lbl">Webhook Amalsholeh (demi keamanan, key ?key=... TIDAK ditampilkan di sini -- minta ke owner sistem):</span><code>' + esc(base) + "/webhook-amalsholeh?key=...</code></div>" +
     "</div>" +
     '<div class="card"><b>20 donasi Saweria terakhir</b>' +
     '<table><thead><tr><th>Donatur</th><th>Jumlah</th><th>Pesan</th><th>Sumber</th><th>Waktu</th></tr></thead><tbody>' +
@@ -410,6 +547,10 @@ app.get(["/", "/status"], async (req, res) => {
     '<table><thead><tr><th>Donatur</th><th>Jumlah</th><th>Pesan</th><th>Sumber</th><th>Waktu</th></tr></thead><tbody>' +
     bagiLogsHtml +
     "</tbody></table></div>" +
+    '<div class="card"><b>20 donasi Amalsholeh terakhir</b>' +
+    '<table><thead><tr><th>Donatur</th><th>Jumlah</th><th>Pesan</th><th>Sumber</th><th>Waktu</th></tr></thead><tbody>' +
+    amalLogsHtml +
+    "</tbody></table></div>" +
     "</div><script>" +
     "function testDonate(){var b=document.getElementById('tb');b.disabled=true;b.textContent='Mengirim...';" +
     "fetch('/test-donate',{method:'POST'}).then(function(r){return r.json()}).then(function(){location.reload()})" +
@@ -417,6 +558,9 @@ app.get(["/", "/status"], async (req, res) => {
     "function testDonateBagi(){var b=document.getElementById('tbBagi');b.disabled=true;b.textContent='Mengirim...';" +
     "fetch('/test-donate-bagibagi',{method:'POST'}).then(function(r){return r.json()}).then(function(){location.reload()})" +
     ".catch(function(){b.disabled=false;b.textContent='Tes BagiBagi'})}" +
+    "function testDonateAmal(){var b=document.getElementById('tbAmal');b.disabled=true;b.textContent='Mengirim...';" +
+    "fetch('/test-donate-amalsholeh',{method:'POST'}).then(function(r){return r.json()}).then(function(){location.reload()})" +
+    ".catch(function(){b.disabled=false;b.textContent='Tes Amalsholeh'})}" +
     "function ago(ms){var d=Math.floor((Date.now()-ms)/1000);if(d<60)return d+' dtk lalu';" +
     "if(d<3600)return Math.floor(d/60)+' mnt lalu';if(d<86400)return Math.floor(d/3600)+' jam lalu';return Math.floor(d/86400)+' hari lalu'}" +
     "document.querySelectorAll('[data-at]').forEach(function(el){el.textContent=ago(Number(el.getAttribute('data-at')))});" +
