@@ -1,11 +1,17 @@
 // ============================================================
 //  JEMBATAN WEBHOOK SAWERIA + BAGIBAGI + AMALSHOLEH  ->  ROBLOX
-//  Versi 1.4 (BARU: Amalsholeh MENOLAK memasang webhook kita -- campaign "noctis-for-kalimantan"
+//  Versi 1.5 (v1.4: Amalsholeh MENOLAK memasang webhook kita -- campaign "noctis-for-kalimantan"
 //  ternyata ada di akun "NOCTIS" milik Amalsholeh sendiri, TERPISAH dari akun IBS Foundation,
 //  dan Amalsholeh tidak mengizinkan webhook dipasang ke situ. Sebagai gantinya, server ini
-//  sekarang bisa "polling" langsung halaman publik campaign-nya (lihat AMALSHOLEH_CAMPAIGN_SLUG
-//  di bawah) alih-alih menunggu webhook. Jalur webhook Amalsholeh yang lama TETAP ADA/TIDAK
-//  dihapus (siapa tahu suatu saat diizinkan lagi), begitu juga Saweria & BagiBagi TIDAK diubah.)
+//  bisa "polling" langsung data donatur campaign-nya (lihat AMALSHOLEH_CAMPAIGN_SLUG di bawah)
+//  alih-alih menunggu webhook.
+//  [BARU v1.5] Sumber polling-nya DIGANTI: v1.4 baca dari halaman utama campaign
+//  (www.amalsholeh.com/<slug>/__data.json), tapi ternyata data di situ di-cache/telat di sisi
+//  Amalsholeh. v1.5 pindah ke endpoint donatur yang dipakai halaman ".../<slug>/donatur" milik
+//  campaign itu sendiri (core.sholeh.app) yang terbukti jauh lebih real-time -- lihat catatan
+//  lengkap di dekat fetchAmalsholehCampaignDonors(). Jalur webhook Amalsholeh yang lama TETAP
+//  ADA/TIDAK dihapus (siapa tahu suatu saat diizinkan lagi), begitu juga Saweria & BagiBagi
+//  TIDAK diubah.)
 //
 //  Tugas server ini:
 //   1) Menerima "tembakan" donasi dari Saweria, BagiBagi & Amalsholeh (webhook / POST).
@@ -284,12 +290,24 @@ async function rememberAmalsholehProgram(programId, programName) {
   }
 }
 
-// ---- Scraping halaman publik campaign Amalsholeh (BARU, v1.4) ----
+// ---- Scraping donatur Amalsholeh (BARU v1.4; SUMBER DIGANTI di v1.5) ----
 // Amalsholeh menolak memasang webhook kita, jadi ini cara alternatif: baca langsung data
-// donatur yang memang PUBLIK dan bisa dilihat siapa saja di halaman campaign-nya. Ini BUKAN
-// API resmi -- ini "menebeng" struktur data internal (SvelteKit __data.json) yang dipakai
-// halaman itu sendiri untuk merender daftar donatur. Kalau Amalsholeh mengubah struktur
-// halamannya, fungsi ini bisa berhenti bekerja dan perlu diperbaiki ulang.
+// donatur yang memang PUBLIK dan bisa dilihat siapa saja. Ini BUKAN API resmi -- ini
+// "menebeng" endpoint backend yang dipakai Amalsholeh sendiri untuk menampilkan data
+// donatur. Kalau Amalsholeh mengubah struktur/endpoint-nya, fungsi ini bisa berhenti
+// bekerja dan perlu diperbaiki ulang.
+//
+// [DIPERBARUI 2026-09-24, v1.5] v1.4 baca dari halaman UTAMA campaign
+// (www.amalsholeh.com/<slug>/__data.json). Setelah dites pakai donasi beneran, ketahuan
+// data di halaman utama itu di-cache/di-batch di sisi Amalsholeh -- donatur baru & bahkan
+// "total_donors"-nya bisa telat muncul (dalam pengetesan kami, tercatat delay ~2-27 menit,
+// dan sempat "macet" sama sekali tidak update walau donasi baru sudah masuk & tercatat di
+// backend Amalsholeh). SEMENTARA halaman ".../<slug>/donatur" milik campaign itu sendiri
+// ternyata manggil API BERBEDA (domain terpisah, core.sholeh.app) yang jauh lebih
+// real-time (donasi baru sempat kekonfirmasi muncul di situ dalam hitungan menit, bahkan
+// pernah <1 menit). Makanya v1.5 pindah scraping ke endpoint itu. Bentuk data balikannya
+// JSON biasa (bukan format "devalue" ala SvelteKit yang dipakai halaman utama), jadi
+// parsing-nya juga jadi lebih simpel.
 
 // Ubah teks nominal ala Amalsholeh ("Rp 50.000") jadi angka murni.
 function parseRupiahText(s) {
@@ -298,31 +316,28 @@ function parseRupiahText(s) {
   return digits ? parseInt(digits, 10) : 0;
 }
 
-// Ambil daftar donatur TERBARU langsung dari halaman publik campaign Amalsholeh.
+// Ambil daftar donatur TERBARU langsung dari API donatur (core.sholeh.app) milik campaign
+// Amalsholeh -- sumber yang sama dipakai halaman ".../<slug>/donatur" itu sendiri.
 async function fetchAmalsholehCampaignDonors(slug) {
-  const url = "https://www.amalsholeh.com/" + encodeURIComponent(slug) + "/__data.json";
+  const url =
+    "https://core.sholeh.app/api/v1/program/" + encodeURIComponent(slug) + "/donatur?per_page=15";
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 6000);
   try {
     const r = await fetch(url, { signal: controller.signal });
     if (!r.ok) throw new Error("status " + r.status);
     const json = await r.json();
-    const arr = json.nodes && json.nodes[1] && json.nodes[1].data;
-    if (!Array.isArray(arr)) throw new Error("bentuk data tidak dikenali");
-    const root = arr[0];
-    const donaturIdxList = arr[root.donatur];
-    if (!Array.isArray(donaturIdxList)) return [];
-    return donaturIdxList
-      .map((idx) => {
-        const item = arr[idx] || {};
-        const isAnon = !!arr[item.anonymous];
-        const rawName = item.user_name != null ? arr[item.user_name] : null;
-        const rawMessage = item.message != null ? arr[item.message] : null;
+    const list = json && json.data && Array.isArray(json.data.data) ? json.data.data : null;
+    if (!Array.isArray(list)) throw new Error("bentuk data tidak dikenali");
+    return list
+      .map((item) => {
+        const isAnon = !!item.anonymous;
+        const rawName = item.user_name;
         return {
-          contentId: item.content_id != null ? String(arr[item.content_id]) : null,
+          contentId: item.content_id != null ? String(item.content_id) : null,
           donator: isAnon || !rawName ? "Hamba Allah" : String(rawName),
-          amount: parseRupiahText(item.amount != null ? arr[item.amount] : null),
-          message: rawMessage ? String(rawMessage) : "",
+          amount: parseRupiahText(item.amount),
+          message: item.message ? String(item.message) : "",
         };
       })
       .filter((d) => d.contentId);
