@@ -1,6 +1,8 @@
 // ============================================================
 //  JEMBATAN WEBHOOK SAWERIA + BAGIBAGI + AMALSHOLEH  ->  ROBLOX
-//  Versi 1.2 (nambah dukungan Amalsholeh, jalur Saweria & BagiBagi TIDAK diubah)
+//  Versi 1.3 (tambah filter campaign opsional utk Amalsholeh via AMALSHOLEH_PROGRAM_ID,
+//  jalur Saweria & BagiBagi TIDAK diubah, dan tanpa PROGRAM_ID perilaku Amalsholeh
+//  TIDAK BERUBAH -- backward-compatible)
 //
 //  Tugas server ini:
 //   1) Menerima "tembakan" donasi dari Saweria, BagiBagi & Amalsholeh (webhook / POST).
@@ -64,6 +66,15 @@ const BAGIBAGI_WEBHOOK_TOKEN = process.env.BAGIBAGI_WEBHOOK_TOKEN || "";
 // dilewati (mode tes, kurang aman), sama seperti STREAM_KEY & BAGIBAGI_WEBHOOK_TOKEN.
 const AMALSHOLEH_WEBHOOK_SECRET = process.env.AMALSHOLEH_WEBHOOK_SECRET || "";
 
+// ID Campaign/Program Amalsholeh yang BOLEH diteruskan ke Roblox (opsional, BARU).
+// Amalsholeh cuma punya webhook di level LEMBAGA (bukan per-campaign), jadi kalau
+// dikosongkan -> SEMUA campaign lembaga ini diterima (perilaku lama, backward-compatible,
+// aman dipasang SEBELUM campaign-nya dibuat). Kalau nanti diisi (angka ID campaign, ambil
+// dari "Program terakhir terdeteksi" di halaman status setelah 1x donasi tes/real masuk) ->
+// HANYA donasi dari campaign itu yang diteruskan ke Roblox; donasi dari campaign lain di
+// lembaga yang sama akan DIABAIKAN (tapi tetap dicatat programnya biar gampang dicek).
+const AMALSHOLEH_PROGRAM_ID = process.env.AMALSHOLEH_PROGRAM_ID || "";
+
 // Koneksi Redis (Upstash). (TIDAK BERUBAH)
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL,
@@ -82,6 +93,7 @@ const BAGI_LOG_KEY = "bagibagi:log";
 // supaya tidak mungkin saling menimpa/ganggu.
 const AMAL_QUEUE_KEY = "amalsholeh:queue";
 const AMAL_LOG_KEY = "amalsholeh:log";
+const AMAL_LASTPROGRAM_KEY = "amalsholeh:lastprogram"; // simpan campaign/program TERAKHIR yang lewat webhook (BARU, bantu cari programId yang benar)
 
 const app = express();
 
@@ -196,7 +208,17 @@ function pickAmalsholehDonationFields(body) {
   const donator = user.name || "Hamba Allah";
   const amount = Number(donation.amount != null ? donation.amount : 0) || 0;
   const message = user.message || "";
-  return { donator: String(donator), amount, message: String(message) };
+  // BARU: info campaign/program (dari donation.program.{id,name,slug}), dipakai utk filter.
+  const program = donation.program || {};
+  const programId = program.id != null ? String(program.id) : "";
+  const programName = program.name || "";
+  return {
+    donator: String(donator),
+    amount,
+    message: String(message),
+    programId,
+    programName: String(programName),
+  };
 }
 
 async function pushDonation(d, source, queueKey, logKey) {
@@ -219,6 +241,28 @@ function parseMaybe(x) {
     }
   }
   return x;
+}
+
+// Cek apakah donasi Amalsholeh ini boleh diteruskan, berdasarkan filter AMALSHOLEH_PROGRAM_ID
+// (BARU). Kosong -> terima semua campaign lembaga ini (perilaku lama, backward-compatible).
+// Diisi -> harus persis sama dengan programId donasi yang masuk.
+function isAllowedAmalsholehProgram(programId) {
+  if (!AMALSHOLEH_PROGRAM_ID) return true; // filter belum diaktifkan -> terima semua
+  return String(programId || "") === String(AMALSHOLEH_PROGRAM_ID);
+}
+
+// Catat program/campaign TERAKHIR yang lewat webhook Amalsholeh (BARU) -- dipanggil utk
+// SETIAP donasi yang masuk (baik nanti diterima ataupun diabaikan filter), supaya gampang
+// dicek dari halaman status program ID mana yang beneran datang dari campaign yang didaftarkan.
+async function rememberAmalsholehProgram(programId, programName) {
+  try {
+    await redis.set(
+      AMAL_LASTPROGRAM_KEY,
+      JSON.stringify({ id: programId || "", name: programName || "", at: Date.now() })
+    );
+  } catch (e) {
+    console.error("[webhook-amalsholeh] gagal simpan info program terakhir:", e);
+  }
 }
 
 // ============================================================
@@ -350,6 +394,24 @@ app.post(["/webhook-amalsholeh", "/api/webhook-amalsholeh"], async (req, res) =>
     return res.json({ ok: true, ignored: true });
   }
   const d = pickAmalsholehDonationFields(body);
+
+  // BARU: catat program/campaign yang barusan masuk -- dilakukan SELALU (diterima
+  // ataupun diabaikan filter), supaya "Program terakhir terdeteksi" di halaman status
+  // selalu up to date dan bisa dipakai buat cari tahu programId campaign yang benar.
+  await rememberAmalsholehProgram(d.programId, d.programName);
+
+  // BARU: kalau AMALSHOLEH_PROGRAM_ID sudah diisi, cuma terima donasi dari campaign itu.
+  // Kalau masih kosong (belum diaktifkan) -> semua campaign lembaga ini tetap diterima,
+  // persis seperti sebelum patch ini (backward-compatible).
+  if (!isAllowedAmalsholehProgram(d.programId)) {
+    console.warn(
+      "[webhook-amalsholeh] donasi dari campaign lain diabaikan (filter aktif):",
+      d.programId,
+      d.programName
+    );
+    return res.json({ ok: true, ignored: true, reason: "program-tidak-sesuai-filter" });
+  }
+
   if (!d.donator || d.amount <= 0) {
     return res.status(400).json({ ok: false, error: "data donasi tidak lengkap" });
   }
@@ -433,6 +495,7 @@ app.get(["/", "/status"], async (req, res) => {
   let logs = [];
   let bagiLogs = [];
   let amalLogs = [];
+  let amalLastProgram = null; // BARU
   try {
     queueLen = await redis.llen(QUEUE_KEY);
     bagiQueueLen = await redis.llen(BAGI_QUEUE_KEY);
@@ -443,6 +506,8 @@ app.get(["/", "/status"], async (req, res) => {
     bagiLogs = (bagiRaw || []).map(parseMaybe).filter(Boolean);
     const amalRaw = await redis.lrange(AMAL_LOG_KEY, 0, LOG_MAX - 1);
     amalLogs = (amalRaw || []).map(parseMaybe).filter(Boolean);
+    const amalLastRaw = await redis.get(AMAL_LASTPROGRAM_KEY); // BARU
+    amalLastProgram = parseMaybe(amalLastRaw); // BARU
     redisOk = true;
   } catch (e) {
     redisOk = false;
@@ -454,6 +519,7 @@ app.get(["/", "/status"], async (req, res) => {
   const verifyOn = !!STREAM_KEY;
   const bagiVerifyOn = !!BAGIBAGI_WEBHOOK_TOKEN;
   const amalVerifyOn = !!AMALSHOLEH_WEBHOOK_SECRET;
+  const amalFilterOn = !!AMALSHOLEH_PROGRAM_ID; // BARU
   const okBadge = '<span class="b ok">&#10003; tersambung</span>';
   const errBadge = '<span class="b err">&#10007; gagal — cek integrasi Upstash</span>';
 
@@ -522,6 +588,16 @@ app.get(["/", "/status"], async (req, res) => {
     (amalVerifyOn ? '<span class="b on">aktif (aman)</span>' : '<span class="b warn">nonaktif (mode tes)</span>') +
     "</div>" +
     '<div class="row"><span class="k">Donasi di antrian (belum diambil Roblox)</span><b>' + amalQueueLen + "</b></div>" +
+    '<div class="row"><span class="k">Filter campaign (AMALSHOLEH_PROGRAM_ID)</span>' +
+    (amalFilterOn
+      ? '<span class="b on">aktif -- ID: ' + esc(AMALSHOLEH_PROGRAM_ID) + "</span>"
+      : '<span class="b warn">nonaktif (semua campaign lembaga diterima)</span>') +
+    "</div>" +
+    '<div class="row"><span class="k">Program/campaign terakhir terdeteksi</span><b>' +
+    (amalLastProgram && amalLastProgram.id
+      ? esc(amalLastProgram.name || "(tanpa nama)") + " -- ID: " + esc(amalLastProgram.id)
+      : "belum ada donasi masuk") +
+    "</b></div>" +
     "</div>" +
     '<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">' +
     "<div><b>Tes tanpa donasi beneran</b><div class=\"sub\" style=\"margin:2px 0 0\">Masukkan 1 donasi palsu ke antrian.</div></div>" +
