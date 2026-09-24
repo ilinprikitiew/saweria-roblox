@@ -1,8 +1,11 @@
 // ============================================================
 //  JEMBATAN WEBHOOK SAWERIA + BAGIBAGI + AMALSHOLEH  ->  ROBLOX
-//  Versi 1.3 (tambah filter campaign opsional utk Amalsholeh via AMALSHOLEH_PROGRAM_ID,
-//  jalur Saweria & BagiBagi TIDAK diubah, dan tanpa PROGRAM_ID perilaku Amalsholeh
-//  TIDAK BERUBAH -- backward-compatible)
+//  Versi 1.4 (BARU: Amalsholeh MENOLAK memasang webhook kita -- campaign "noctis-for-kalimantan"
+//  ternyata ada di akun "NOCTIS" milik Amalsholeh sendiri, TERPISAH dari akun IBS Foundation,
+//  dan Amalsholeh tidak mengizinkan webhook dipasang ke situ. Sebagai gantinya, server ini
+//  sekarang bisa "polling" langsung halaman publik campaign-nya (lihat AMALSHOLEH_CAMPAIGN_SLUG
+//  di bawah) alih-alih menunggu webhook. Jalur webhook Amalsholeh yang lama TETAP ADA/TIDAK
+//  dihapus (siapa tahu suatu saat diizinkan lagi), begitu juga Saweria & BagiBagi TIDAK diubah.)
 //
 //  Tugas server ini:
 //   1) Menerima "tembakan" donasi dari Saweria, BagiBagi & Amalsholeh (webhook / POST).
@@ -75,6 +78,20 @@ const AMALSHOLEH_WEBHOOK_SECRET = process.env.AMALSHOLEH_WEBHOOK_SECRET || "";
 // lembaga yang sama akan DIABAIKAN (tapi tetap dicatat programnya biar gampang dicek).
 const AMALSHOLEH_PROGRAM_ID = process.env.AMALSHOLEH_PROGRAM_ID || "";
 
+// Slug campaign Amalsholeh yang mau di-"polling" langsung dari halaman publiknya (BARU, v1.4).
+// Ini workaround karena Amalsholeh MENOLAK memasang webhook kita di akun campaign ini. Alih-alih
+// menunggu webhook, server ini AKTIF mengambil sendiri data donatur dari halaman publik
+// https://www.amalsholeh.com/<slug> setiap kali endpoint /prime-amalsholeh atau halaman status
+// dipanggil (ada jeda minimum antar-scrape, lihat AMAL_SCRAPE_MIN_INTERVAL_MS, supaya sopan ke
+// server mereka). Karena ini scoped ke SATU halaman campaign tertentu, otomatis TIDAK akan
+// tercampur donasi campaign lain -- makanya AMALSHOLEH_PROGRAM_ID di atas TIDAK diperlukan lagi
+// untuk jalur ini (tetap dibiarkan ada, siapa tahu nanti webhook resmi diizinkan).
+// Kosongkan untuk MENONAKTIFKAN scraping ini sepenuhnya (jalur webhook lama tetap jalan seperti biasa).
+const AMALSHOLEH_CAMPAIGN_SLUG = process.env.AMALSHOLEH_CAMPAIGN_SLUG || "";
+
+// Jangan scrape halaman Amalsholeh lebih sering dari ini (ms) -- BARU, v1.4.
+const AMAL_SCRAPE_MIN_INTERVAL_MS = 8000;
+
 // Koneksi Redis (Upstash). (TIDAK BERUBAH)
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL,
@@ -94,6 +111,8 @@ const BAGI_LOG_KEY = "bagibagi:log";
 const AMAL_QUEUE_KEY = "amalsholeh:queue";
 const AMAL_LOG_KEY = "amalsholeh:log";
 const AMAL_LASTPROGRAM_KEY = "amalsholeh:lastprogram"; // simpan campaign/program TERAKHIR yang lewat webhook (BARU, bantu cari programId yang benar)
+const AMAL_SCRAPE_SEEN_KEY = "amalsholeh:scrape:seen"; // SET content_id donatur yang sudah pernah diproses dari hasil scrape (BARU, v1.4)
+const AMAL_SCRAPE_LASTRUN_KEY = "amalsholeh:scrape:lastrun"; // kapan terakhir kali proses scrape jalan + hasilnya (BARU, v1.4)
 
 const app = express();
 
@@ -265,6 +284,102 @@ async function rememberAmalsholehProgram(programId, programName) {
   }
 }
 
+// ---- Scraping halaman publik campaign Amalsholeh (BARU, v1.4) ----
+// Amalsholeh menolak memasang webhook kita, jadi ini cara alternatif: baca langsung data
+// donatur yang memang PUBLIK dan bisa dilihat siapa saja di halaman campaign-nya. Ini BUKAN
+// API resmi -- ini "menebeng" struktur data internal (SvelteKit __data.json) yang dipakai
+// halaman itu sendiri untuk merender daftar donatur. Kalau Amalsholeh mengubah struktur
+// halamannya, fungsi ini bisa berhenti bekerja dan perlu diperbaiki ulang.
+
+// Ubah teks nominal ala Amalsholeh ("Rp 50.000") jadi angka murni.
+function parseRupiahText(s) {
+  if (s == null) return 0;
+  const digits = String(s).replace(/[^0-9]/g, "");
+  return digits ? parseInt(digits, 10) : 0;
+}
+
+// Ambil daftar donatur TERBARU langsung dari halaman publik campaign Amalsholeh.
+async function fetchAmalsholehCampaignDonors(slug) {
+  const url = "https://www.amalsholeh.com/" + encodeURIComponent(slug) + "/__data.json";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
+  try {
+    const r = await fetch(url, { signal: controller.signal });
+    if (!r.ok) throw new Error("status " + r.status);
+    const json = await r.json();
+    const arr = json.nodes && json.nodes[1] && json.nodes[1].data;
+    if (!Array.isArray(arr)) throw new Error("bentuk data tidak dikenali");
+    const root = arr[0];
+    const donaturIdxList = arr[root.donatur];
+    if (!Array.isArray(donaturIdxList)) return [];
+    return donaturIdxList
+      .map((idx) => {
+        const item = arr[idx] || {};
+        const isAnon = !!arr[item.anonymous];
+        const rawName = item.user_name != null ? arr[item.user_name] : null;
+        const rawMessage = item.message != null ? arr[item.message] : null;
+        return {
+          contentId: item.content_id != null ? String(arr[item.content_id]) : null,
+          donator: isAnon || !rawName ? "Hamba Allah" : String(rawName),
+          amount: parseRupiahText(item.amount != null ? arr[item.amount] : null),
+          message: rawMessage ? String(rawMessage) : "",
+        };
+      })
+      .filter((d) => d.contentId);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Jalankan proses scrape (kalau AMALSHOLEH_CAMPAIGN_SLUG diisi & belum terlalu baru di-scrape),
+// masukkan donatur baru yang belum pernah diproses ke antrian Amalsholeh yang sudah ada.
+// Aman dipanggil berkali-kali -- kalau gagal, cuma dicatat statusnya, tidak melempar error ke
+// pemanggil (supaya endpoint /prime-amalsholeh & halaman status tetap jalan normal walau
+// scrape-nya lagi gagal).
+async function maybeScrapeAmalsholeh() {
+  if (!AMALSHOLEH_CAMPAIGN_SLUG) return;
+  try {
+    const lastRunRaw = await redis.get(AMAL_SCRAPE_LASTRUN_KEY);
+    const lastRun = parseMaybe(lastRunRaw);
+    const now = Date.now();
+    if (lastRun && lastRun.at && now - lastRun.at < AMAL_SCRAPE_MIN_INTERVAL_MS) {
+      return; // masih terlalu baru, jangan scrape dulu (biar sopan ke server Amalsholeh)
+    }
+    // Tandai "lagi jalan" DULU sebelum fetch selesai, supaya request yang datang hampir
+    // bersamaan tidak ikut-ikutan nge-fetch juga.
+    await redis.set(AMAL_SCRAPE_LASTRUN_KEY, JSON.stringify({ at: now, status: "running" }));
+
+    const donors = await fetchAmalsholehCampaignDonors(AMALSHOLEH_CAMPAIGN_SLUG);
+    let newCount = 0;
+    for (const d of donors) {
+      const already = await redis.sismember(AMAL_SCRAPE_SEEN_KEY, d.contentId);
+      if (already) continue;
+      await redis.sadd(AMAL_SCRAPE_SEEN_KEY, d.contentId);
+      if (d.amount > 0) {
+        await pushDonation(
+          { donator: d.donator, amount: d.amount, message: d.message },
+          "scrape-amalsholeh",
+          AMAL_QUEUE_KEY,
+          AMAL_LOG_KEY
+        );
+        newCount++;
+      }
+    }
+    await redis.set(
+      AMAL_SCRAPE_LASTRUN_KEY,
+      JSON.stringify({ at: Date.now(), status: "ok", found: donors.length, new: newCount })
+    );
+  } catch (e) {
+    console.error("[scrape-amalsholeh] gagal:", e);
+    try {
+      await redis.set(
+        AMAL_SCRAPE_LASTRUN_KEY,
+        JSON.stringify({ at: Date.now(), status: "error", error: String((e && e.message) || e) })
+      );
+    } catch (e2) {}
+  }
+}
+
 // ============================================================
 //  GET /prime  -> Roblox ambil 1 donasi Saweria terbaru (TIDAK BERUBAH)
 // ============================================================
@@ -313,6 +428,7 @@ app.get(["/prime-bagibagi", "/api/prime-bagibagi"], async (req, res) => {
 //  Pola identik /prime & /prime-bagibagi, TAPI ambil dari antrian Redis terpisah.
 // ============================================================
 app.get(["/prime-amalsholeh", "/api/prime-amalsholeh"], async (req, res) => {
+  await maybeScrapeAmalsholeh(); // BARU, v1.4: coba tarik donatur baru dari halaman campaign dulu
   try {
     const raw = await redis.lpop(AMAL_QUEUE_KEY);
     const item = parseMaybe(raw);
@@ -496,6 +612,8 @@ app.get(["/", "/status"], async (req, res) => {
   let bagiLogs = [];
   let amalLogs = [];
   let amalLastProgram = null; // BARU
+  let amalScrapeStatus = null; // BARU, v1.4
+  await maybeScrapeAmalsholeh(); // BARU, v1.4: biar buka halaman status juga bisa memicu cek donasi baru
   try {
     queueLen = await redis.llen(QUEUE_KEY);
     bagiQueueLen = await redis.llen(BAGI_QUEUE_KEY);
@@ -508,6 +626,8 @@ app.get(["/", "/status"], async (req, res) => {
     amalLogs = (amalRaw || []).map(parseMaybe).filter(Boolean);
     const amalLastRaw = await redis.get(AMAL_LASTPROGRAM_KEY); // BARU
     amalLastProgram = parseMaybe(amalLastRaw); // BARU
+    const amalScrapeRaw = await redis.get(AMAL_SCRAPE_LASTRUN_KEY); // BARU, v1.4
+    amalScrapeStatus = parseMaybe(amalScrapeRaw); // BARU, v1.4
     redisOk = true;
   } catch (e) {
     redisOk = false;
@@ -520,6 +640,7 @@ app.get(["/", "/status"], async (req, res) => {
   const bagiVerifyOn = !!BAGIBAGI_WEBHOOK_TOKEN;
   const amalVerifyOn = !!AMALSHOLEH_WEBHOOK_SECRET;
   const amalFilterOn = !!AMALSHOLEH_PROGRAM_ID; // BARU
+  const amalScrapeOn = !!AMALSHOLEH_CAMPAIGN_SLUG; // BARU, v1.4
   const okBadge = '<span class="b ok">&#10003; tersambung</span>';
   const errBadge = '<span class="b err">&#10007; gagal — cek integrasi Upstash</span>';
 
@@ -598,6 +719,23 @@ app.get(["/", "/status"], async (req, res) => {
       ? esc(amalLastProgram.name || "(tanpa nama)") + " -- ID: " + esc(amalLastProgram.id)
       : "belum ada donasi masuk") +
     "</b></div>" +
+    '<div class="row"><span class="k">Polling halaman campaign (AMALSHOLEH_CAMPAIGN_SLUG)</span>' +
+    (amalScrapeOn
+      ? '<span class="b on">aktif -- slug: ' + esc(AMALSHOLEH_CAMPAIGN_SLUG) + "</span>"
+      : '<span class="b warn">nonaktif</span>') +
+    "</div>" +
+    (amalScrapeOn
+      ? '<div class="row"><span class="k">Status polling terakhir</span><b>' +
+        (amalScrapeStatus
+          ? esc(amalScrapeStatus.status || "-") +
+            (amalScrapeStatus.status === "ok"
+              ? " (ketemu " + (amalScrapeStatus.found || 0) + ", baru " + (amalScrapeStatus.new || 0) + ")"
+              : amalScrapeStatus.status === "error"
+              ? " -- " + esc(amalScrapeStatus.error || "")
+              : "")
+          : "belum pernah jalan") +
+        "</b></div>"
+      : "") +
     "</div>" +
     '<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">' +
     "<div><b>Tes tanpa donasi beneran</b><div class=\"sub\" style=\"margin:2px 0 0\">Masukkan 1 donasi palsu ke antrian.</div></div>" +
